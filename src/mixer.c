@@ -522,7 +522,9 @@ int Mix_OpenAudioDevice(int frequency, Uint16 format, int nchannels, int chunksi
         mix_channel[i].effects = NULL;
         mix_channel[i].paused = 0;
     }
-    Mix_VolumeMusic(SDL_MIX_MAXVOLUME);
+    for (i=0; i<MIX_NUM_MUSIC_STREAMS; ++i) {
+        Mix_VolumeMusic(i, SDL_MIX_MAXVOLUME);
+    }
 
     _Mix_InitEffects();
 
@@ -1394,7 +1396,9 @@ void Mix_CloseAudio(void)
             }
             Mix_UnregisterAllEffects(MIX_CHANNEL_POST);
             close_music();
-            Mix_SetMusicCMD(NULL);
+            for (i=0; i<MIX_NUM_MUSIC_STREAMS; ++i) {
+                Mix_SetMusicCMD(i, NULL);
+            }
             Mix_HaltChannel(-1);
             _Mix_DeinitEffects();
             SDL_CloseAudioDevice(audio_device);

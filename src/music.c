@@ -55,9 +55,9 @@
     "SDL_MIXER_DEBUG_MUSIC_INTERFACES"
 
 char *music_cmd = NULL;
-static SDL_bool music_active = SDL_TRUE;
-static int music_volume = MIX_MAX_VOLUME;
-static Mix_Music * volatile music_playing = NULL;
+static SDL_bool music_active[MIX_NUM_MUSIC_STREAMS] = {SDL_TRUE, SDL_TRUE};
+static int music_volume[MIX_NUM_MUSIC_STREAMS] = {MIX_MAX_VOLUME, MIX_MAX_VOLUME};
+static Mix_Music* volatile music_playing[MIX_NUM_MUSIC_STREAMS] = {NULL};
 SDL_AudioSpec music_spec;
 
 struct _Mix_Music {
@@ -262,18 +262,18 @@ static void add_music_decoder(const char *decoder)
 }
 
 /* Local low-level functions prototypes */
-static void music_internal_initialize_volume(void);
-static void music_internal_volume(int volume);
-static int  music_internal_play(Mix_Music *music, int play_count, double position);
-static int  music_internal_position(double position);
-static SDL_bool music_internal_playing(void);
-static void music_internal_halt(void);
+static void music_internal_initialize_volume(int channel);
+static void music_internal_volume(int channel, int volume);
+static int  music_internal_play(int channel, Mix_Music *music, int play_count, double position);
+static int  music_internal_position(int channel, double position);
+static SDL_bool music_internal_playing(int channel);
+static void music_internal_halt(int channel);
 
 
 /* Support for hooking when the music has finished */
-static void (SDLCALL *music_finished_hook)(void) = NULL;
+static void (SDLCALL *music_finished_hook)(int channel) = NULL;
 
-void Mix_HookMusicFinished(void (SDLCALL *music_finished)(void))
+void Mix_HookMusicFinished(void (SDLCALL *music_finished)(int channel))
 {
     Mix_LockAudio();
     music_finished_hook = music_finished;
@@ -328,77 +328,89 @@ int music_pcm_getaudio(void *context, void *data, int bytes, int volume,
 }
 
 /* Mixing function */
-void SDLCALL music_mixer(void *udata, Uint8 *stream, int len)
+void SDLCALL music_mixer(void *udata, Uint8 *streamstart, int lenstart)
 {
-    SDL_bool done = SDL_FALSE;
-
     (void)udata;
+    Uint8* buffer = SDL_malloc(lenstart);
 
-    while (music_playing && music_active && len > 0 && !done) {
-        /* Handle fading */
-        if (music_playing->fading != MIX_NO_FADING) {
-            if (music_playing->fade_step++ < music_playing->fade_steps) {
-                int volume;
-                int fade_step = music_playing->fade_step;
-                int fade_steps = music_playing->fade_steps;
+    for (int i = 0; i < MIX_NUM_MUSIC_STREAMS; ++i) {
+        SDL_bool done = SDL_FALSE;
+        Uint8* stream = buffer;
+        int len = lenstart;
 
-                if (music_playing->fading == MIX_FADING_OUT) {
-                    volume = (music_volume * (fade_steps-fade_step)) / fade_steps;
-                } else { /* Fading in */
-                    volume = (music_volume * fade_step) / fade_steps;
-                }
-                music_internal_volume(volume);
-            } else {
-                if (music_playing->fading == MIX_FADING_OUT) {
-                    music_internal_halt();
-                    if (music_finished_hook) {
-                        music_finished_hook();
+        SDL_memset(stream, music_spec.silence, len);
+
+        while (music_playing[i] && music_active[i] && len > 0 && !done) {
+            /* Handle fading */
+            if (music_playing[i]->fading != MIX_NO_FADING) {
+                if (music_playing[i]->fade_step++ < music_playing[i]->fade_steps) {
+                    int volume;
+                    int fade_step = music_playing[i]->fade_step;
+                    int fade_steps = music_playing[i]->fade_steps;
+
+                    if (music_playing[i]->fading == MIX_FADING_OUT) {
+                        volume = (music_volume[i] * (fade_steps-fade_step)) / fade_steps;
+                    } else { /* Fading in */
+                        volume = (music_volume[i] * fade_step) / fade_steps;
                     }
-                    return;
+                    music_internal_volume(i, volume);
+                } else {
+                    if (music_playing[i]->fading == MIX_FADING_OUT) {
+                        music_internal_halt(i);
+                        if (music_finished_hook) {
+                            music_finished_hook(i);
+                        }
+                    }
+                    music_playing[i]->fading = MIX_NO_FADING;
                 }
-                music_playing->fading = MIX_NO_FADING;
             }
-        }
 
-        if (music_playing->interface->GetAudio) {
-            int left = music_playing->interface->GetAudio(music_playing->context, stream, len);
-            if (left != 0) {
-                /* Either an error or finished playing with data left */
-                music_playing->playing = SDL_FALSE;
-                done = SDL_TRUE;
-            }
-            if (left > 0) {
-                stream += (len - left);
-                len = left;
+            if (music_playing[i]->interface->GetAudio) {
+                int left = music_playing[i]->interface->GetAudio(music_playing[i]->context, stream, len);
+                if (left != 0) {
+                    /* Either an error or finished playing with data left */
+                    music_playing[i]->playing = SDL_FALSE;
+                    done = SDL_TRUE;
+                }
+                if (left > 0) {
+                    stream += (len - left);
+                    len = left;
+                } else {
+                    len = 0;
+                }
             } else {
                 len = 0;
             }
-        } else {
-            len = 0;
-        }
 
-        if (!music_internal_playing()) {
-            music_internal_halt();
-            if (music_finished_hook) {
-                music_finished_hook();
+            if (!music_internal_playing(i)) {
+                music_internal_halt(i);
+                if (music_finished_hook) {
+                    music_finished_hook(i);
+                }
             }
         }
+
+        SDL_MixAudioFormat(streamstart, buffer, music_spec.format, (Uint32)lenstart, SDL_MIX_MAXVOLUME);
     }
+
+    SDL_free(buffer);
 }
 
 void pause_async_music(int pause_on)
 {
-    if (!music_active || !music_playing || !music_playing->interface) {
-        return;
-    }
-
-    if (pause_on) {
-        if (music_playing->interface->Pause) {
-            music_playing->interface->Pause(music_playing->context);
+    for (int i = 0; i < MIX_NUM_MUSIC_STREAMS; ++i) {
+        if (!music_active[i] || !music_playing[i] || !music_playing[i]->interface) {
+            return;
         }
-    } else {
-        if (music_playing->interface->Resume) {
-            music_playing->interface->Resume(music_playing->context);
+
+        if (pause_on) {
+            if (music_playing[i]->interface->Pause) {
+                music_playing[i]->interface->Pause(music_playing[i]->context);
+            }
+        } else {
+            if (music_playing[i]->interface->Resume) {
+                music_playing[i]->interface->Resume(music_playing[i]->context);
+            }
         }
     }
 }
@@ -526,7 +538,9 @@ void open_music(const SDL_AudioSpec *spec)
     music_spec = *spec;
     open_music_type(MUS_NONE);
 
-    Mix_VolumeMusic(MIX_MAX_VOLUME);
+    for (int i = 0; i < MIX_NUM_MUSIC_STREAMS; ++i) {
+        Mix_VolumeMusic(i, MIX_MAX_VOLUME);
+    }
 
     /* Calculate the number of ms for each callback */
     ms_per_step = (int) (((float)spec->samples * 1000.0f) / spec->freq);
@@ -810,15 +824,17 @@ void Mix_FreeMusic(Mix_Music *music)
     if (music) {
         /* Stop the music if it's currently playing */
         Mix_LockAudio();
-        if (music == music_playing) {
-            /* Wait for any fade out to finish */
-            while (music_active && music->fading == MIX_FADING_OUT) {
-                Mix_UnlockAudio();
-                SDL_Delay(100);
-                Mix_LockAudio();
-            }
-            if (music == music_playing) {
-                music_internal_halt();
+        for (int i = 0; i < MIX_NUM_MUSIC_STREAMS; ++i) {
+            if (music == music_playing[i]) {
+                /* Wait for any fade out to finish */
+                while (music_active[i] && music->fading == MIX_FADING_OUT) {
+                    Mix_UnlockAudio();
+                    SDL_Delay(100);
+                    Mix_LockAudio();
+                }
+                if (music == music_playing[i]) {
+                    music_internal_halt(i);
+                }
             }
         }
         Mix_UnlockAudio();
@@ -837,12 +853,6 @@ Mix_MusicType Mix_GetMusicType(const Mix_Music *music)
 
     if (music) {
         type = music->interface->type;
-    } else {
-        Mix_LockAudio();
-        if (music_playing) {
-            type = music_playing->interface->type;
-        }
-        Mix_UnlockAudio();
     }
     return(type);
 }
@@ -854,8 +864,6 @@ static const char * get_music_tag_internal(const Mix_Music *music, Mix_MusicMeta
     Mix_LockAudio();
     if (music && music->interface->GetMetaTag) {
         tag = music->interface->GetMetaTag(music->context, tag_type);
-    } else if (music_playing && music_playing->interface->GetMetaTag) {
-        tag = music_playing->interface->GetMetaTag(music_playing->context, tag_type);
     } else {
         Mix_SetError("Music isn't playing");
     }
@@ -878,9 +886,6 @@ const char *Mix_GetMusicTitle(const Mix_Music *music)
     if (music) {
         return music->filename;
     }
-    if (music_playing) {
-        return music_playing->filename;
-    }
     return "";
 }
 
@@ -901,19 +906,19 @@ const char *Mix_GetMusicCopyrightTag(const Mix_Music *music)
 
 /* Play a music chunk.  Returns 0, or -1 if there was an error.
  */
-static int music_internal_play(Mix_Music *music, int play_count, double position)
+static int music_internal_play(int channel, Mix_Music *music, int play_count, double position)
 {
     int retval = 0;
 
     /* Note the music we're playing */
-    if (music_playing) {
-        music_internal_halt();
+    if (music_playing[channel]) {
+        music_internal_halt(channel);
     }
-    music_playing = music;
-    music_playing->playing = SDL_TRUE;
+    music_playing[channel] = music;
+    music_playing[channel]->playing = SDL_TRUE;
 
     /* Set the initial volume */
-    music_internal_initialize_volume();
+    music_internal_initialize_volume(channel);
 
     /* Set up for playback */
     retval = music->interface->Play(music->context, play_count);
@@ -921,24 +926,24 @@ static int music_internal_play(Mix_Music *music, int play_count, double position
     /* Set the playback position, note any errors if an offset is used */
     if (retval == 0) {
         if (position > 0.0) {
-            if (music_internal_position(position) < 0) {
+            if (music_internal_position(channel, position) < 0) {
                 Mix_SetError("Position not implemented for music type");
                 retval = -1;
             }
         } else {
-            music_internal_position(0.0);
+            music_internal_position(channel, 0.0);
         }
     }
 
     /* If the setup failed, we're not playing any music anymore */
     if (retval < 0) {
         music->playing = SDL_FALSE;
-        music_playing = NULL;
+        music_playing[channel] = NULL;
     }
     return(retval);
 }
 
-int Mix_FadeInMusicPos(Mix_Music *music, int loops, int ms, double position)
+int Mix_FadeInMusicPos(int channel, Mix_Music *music, int loops, int ms, double position)
 {
     int retval;
 
@@ -965,7 +970,7 @@ int Mix_FadeInMusicPos(Mix_Music *music, int loops, int ms, double position)
     /* Play the puppy */
     Mix_LockAudio();
     /* If the current music is fading out, wait for the fade to complete */
-    while (music_playing && (music_playing->fading == MIX_FADING_OUT)) {
+    while (music_playing[channel] && (music_playing[channel]->fading == MIX_FADING_OUT)) {
         Mix_UnlockAudio();
         SDL_Delay(100);
         Mix_LockAudio();
@@ -974,31 +979,31 @@ int Mix_FadeInMusicPos(Mix_Music *music, int loops, int ms, double position)
         /* Loop is the number of times to play the audio */
         loops = 1;
     }
-    retval = music_internal_play(music, loops, position);
+    retval = music_internal_play(channel, music, loops, position);
     /* Set music as active */
-    music_active = (retval == 0);
+    music_active[channel] = (retval == 0);
     Mix_UnlockAudio();
 
     return(retval);
 }
-int Mix_FadeInMusic(Mix_Music *music, int loops, int ms)
+int Mix_FadeInMusic(int channel, Mix_Music *music, int loops, int ms)
 {
-    return Mix_FadeInMusicPos(music, loops, ms, 0.0);
+    return Mix_FadeInMusicPos(channel, music, loops, ms, 0.0);
 }
-int Mix_PlayMusic(Mix_Music *music, int loops)
+int Mix_PlayMusic(int channel, Mix_Music *music, int loops)
 {
-    return Mix_FadeInMusicPos(music, loops, 0, 0.0);
+    return Mix_FadeInMusicPos(channel, music, loops, 0, 0.0);
 }
 
 /* Jump to a given order in mod music. */
-int Mix_ModMusicJumpToOrder(int order)
+int Mix_ModMusicJumpToOrder(int channel, int order)
 {
     int retval = -1;
 
     Mix_LockAudio();
-    if (music_playing) {
-        if (music_playing->interface->Jump) {
-            retval = music_playing->interface->Jump(music_playing->context, order);
+    if (music_playing[channel]) {
+        if (music_playing[channel]->interface->Jump) {
+            retval = music_playing[channel]->interface->Jump(music_playing[channel]->context, order);
         } else {
             Mix_SetError("Jump not implemented for music type");
         }
@@ -1011,20 +1016,20 @@ int Mix_ModMusicJumpToOrder(int order)
 }
 
 /* Set the playing music position */
-int music_internal_position(double position)
+int music_internal_position(int channel, double position)
 {
-    if (music_playing->interface->Seek) {
-        return music_playing->interface->Seek(music_playing->context, position);
+    if (music_playing[channel]->interface->Seek) {
+        return music_playing[channel]->interface->Seek(music_playing[channel]->context, position);
     }
     return -1;
 }
-int Mix_SetMusicPosition(double position)
+int Mix_SetMusicPosition(int channel, double position)
 {
     int retval;
 
     Mix_LockAudio();
-    if (music_playing) {
-        retval = music_internal_position(position);
+    if (music_playing[channel]) {
+        retval = music_internal_position(channel, position);
         if (retval < 0) {
             Mix_SetError("Position not implemented for music type");
         }
@@ -1052,8 +1057,6 @@ double Mix_GetMusicPosition(Mix_Music *music)
     Mix_LockAudio();
     if (music) {
         retval = music_internal_position_get(music);
-    } else if (music_playing) {
-        retval = music_internal_position_get(music_playing);
     } else {
         Mix_SetError("Music isn't playing");
         retval = -1.0;
@@ -1079,8 +1082,6 @@ double Mix_MusicDuration(Mix_Music *music)
     Mix_LockAudio();
     if (music) {
         retval = music_internal_duration(music);
-    } else if (music_playing) {
-        retval = music_internal_duration(music_playing);
     } else {
         Mix_SetError("music is NULL and no playing music");
         retval = -1.0;
@@ -1105,8 +1106,6 @@ double Mix_GetMusicLoopStartTime(Mix_Music *music)
     Mix_LockAudio();
     if (music) {
         retval = music_internal_loop_start(music);
-    } else if (music_playing) {
-        retval = music_internal_loop_start(music_playing);
     } else {
         Mix_SetError("Music isn't playing");
         retval = -1.0;
@@ -1131,8 +1130,6 @@ double Mix_GetMusicLoopEndTime(Mix_Music *music)
     Mix_LockAudio();
     if (music) {
         retval = music_internal_loop_end(music);
-    } else if (music_playing) {
-        retval = music_internal_loop_end(music_playing);
     } else {
         Mix_SetError("Music isn't playing");
         retval = -1.0;
@@ -1157,8 +1154,6 @@ double Mix_GetMusicLoopLengthTime(Mix_Music *music)
     Mix_LockAudio();
     if (music) {
         retval = music_internal_loop_length(music);
-    } else if (music_playing) {
-        retval = music_internal_loop_length(music_playing);
     } else {
         Mix_SetError("Music isn't playing");
         retval = -1.0;
@@ -1169,37 +1164,37 @@ double Mix_GetMusicLoopLengthTime(Mix_Music *music)
 }
 
 /* Set the music's initial volume */
-static void music_internal_initialize_volume(void)
+static void music_internal_initialize_volume(int channel)
 {
-    if (music_playing->fading == MIX_FADING_IN) {
-        music_internal_volume(0);
+    if (music_playing[channel]->fading == MIX_FADING_IN) {
+        music_internal_volume(channel, 0);
     } else {
-        music_internal_volume(music_volume);
+        music_internal_volume(channel, music_volume[channel]);
     }
 }
 
 /* Set the music volume */
-static void music_internal_volume(int volume)
+static void music_internal_volume(int channel, int volume)
 {
-    if (music_playing->interface->SetVolume) {
-        music_playing->interface->SetVolume(music_playing->context, volume);
+    if (music_playing[channel]->interface->SetVolume) {
+        music_playing[channel]->interface->SetVolume(music_playing[channel]->context, volume);
     }
 }
-int Mix_VolumeMusic(int volume)
+int Mix_VolumeMusic(int channel, int volume)
 {
     int prev_volume;
 
-    prev_volume = music_volume;
+    prev_volume = music_volume[channel];
     if (volume < 0) {
         return prev_volume;
     }
     if (volume > SDL_MIX_MAXVOLUME) {
         volume = SDL_MIX_MAXVOLUME;
     }
-    music_volume = volume;
+    music_volume[channel] = volume;
     Mix_LockAudio();
-    if (music_playing) {
-        music_internal_volume(music_volume);
+    if (music_playing[channel]) {
+        music_internal_volume(channel, music_volume[channel]);
     }
     Mix_UnlockAudio();
     return(prev_volume);
@@ -1209,35 +1204,31 @@ int Mix_GetMusicVolume(Mix_Music *music)
 {
     int prev_volume;
 
-    if (music && music->interface->GetVolume)
+    if (music && music->interface->GetVolume) {
         prev_volume = music->interface->GetVolume(music->context);
-    else if (music_playing && music_playing->interface->GetVolume) {
-        prev_volume = music_playing->interface->GetVolume(music_playing->context);
-    } else {
-        prev_volume = music_volume;
     }
 
     return prev_volume;
 }
 
 /* Halt playing of music */
-static void music_internal_halt(void)
+static void music_internal_halt(int channel)
 {
-    if (music_playing->interface->Stop) {
-        music_playing->interface->Stop(music_playing->context);
+    if (music_playing[channel]->interface->Stop) {
+        music_playing[channel]->interface->Stop(music_playing[channel]->context);
     }
 
-    music_playing->playing = SDL_FALSE;
-    music_playing->fading = MIX_NO_FADING;
-    music_playing = NULL;
+    music_playing[channel]->playing = SDL_FALSE;
+    music_playing[channel]->fading = MIX_NO_FADING;
+    music_playing[channel] = NULL;
 }
-int Mix_HaltMusic(void)
+int Mix_HaltMusic(int channel)
 {
     Mix_LockAudio();
-    if (music_playing) {
-        music_internal_halt();
+    if (music_playing[channel]) {
+        music_internal_halt(channel);
         if (music_finished_hook) {
-            music_finished_hook();
+            music_finished_hook(channel);
         }
     }
     Mix_UnlockAudio();
@@ -1246,7 +1237,7 @@ int Mix_HaltMusic(void)
 }
 
 /* Progressively stop the music */
-int Mix_FadeOutMusic(int ms)
+int Mix_FadeOutMusic(int channel, int ms)
 {
     int retval = 0;
 
@@ -1256,27 +1247,27 @@ int Mix_FadeOutMusic(int ms)
     }
 
     if (ms <= 0) {  /* just halt immediately. */
-        Mix_HaltMusic();
+        Mix_HaltMusic(channel);
         return 1;
     }
 
     Mix_LockAudio();
-    if (music_playing) {
+    if (music_playing[channel]) {
         int fade_steps = (ms + ms_per_step - 1) / ms_per_step;
-        if (music_playing->fading == MIX_NO_FADING) {
-            music_playing->fade_step = 0;
+        if (music_playing[channel]->fading == MIX_NO_FADING) {
+            music_playing[channel]->fade_step = 0;
         } else {
             int step;
-            int old_fade_steps = music_playing->fade_steps;
-            if (music_playing->fading == MIX_FADING_OUT) {
-                step = music_playing->fade_step;
+            int old_fade_steps = music_playing[channel]->fade_steps;
+            if (music_playing[channel]->fading == MIX_FADING_OUT) {
+                step = music_playing[channel]->fade_step;
             } else {
-                step = old_fade_steps - music_playing->fade_step + 1;
+                step = old_fade_steps - music_playing[channel]->fade_step + 1;
             }
-            music_playing->fade_step = (step * fade_steps) / old_fade_steps;
+            music_playing[channel]->fade_step = (step * fade_steps) / old_fade_steps;
         }
-        music_playing->fading = MIX_FADING_OUT;
-        music_playing->fade_steps = fade_steps;
+        music_playing[channel]->fading = MIX_FADING_OUT;
+        music_playing[channel]->fade_steps = fade_steps;
         retval = 1;
     }
     Mix_UnlockAudio();
@@ -1284,13 +1275,13 @@ int Mix_FadeOutMusic(int ms)
     return(retval);
 }
 
-Mix_Fading Mix_FadingMusic(void)
+Mix_Fading Mix_FadingMusic(int channel)
 {
     Mix_Fading fading = MIX_NO_FADING;
 
     Mix_LockAudio();
-    if (music_playing) {
-        fading = music_playing->fading;
+    if (music_playing[channel]) {
+        fading = music_playing[channel]->fading;
     }
     Mix_UnlockAudio();
 
@@ -1298,38 +1289,38 @@ Mix_Fading Mix_FadingMusic(void)
 }
 
 /* Pause/Resume the music stream */
-void Mix_PauseMusic(void)
+void Mix_PauseMusic(int channel)
 {
     Mix_LockAudio();
-    if (music_playing) {
-        if (music_playing->interface->Pause) {
-            music_playing->interface->Pause(music_playing->context);
+    if (music_playing[channel]) {
+        if (music_playing[channel]->interface->Pause) {
+            music_playing[channel]->interface->Pause(music_playing[channel]->context);
         }
     }
-    music_active = SDL_FALSE;
+    music_active[channel] = SDL_FALSE;
     Mix_UnlockAudio();
 }
 
-void Mix_ResumeMusic(void)
+void Mix_ResumeMusic(int channel)
 {
     Mix_LockAudio();
-    if (music_playing) {
-        if (music_playing->interface->Resume) {
-            music_playing->interface->Resume(music_playing->context);
+    if (music_playing[channel]) {
+        if (music_playing[channel]->interface->Resume) {
+            music_playing[channel]->interface->Resume(music_playing[channel]->context);
         }
     }
-    music_active = SDL_TRUE;
+    music_active[channel] = SDL_TRUE;
     Mix_UnlockAudio();
 }
 
-void Mix_RewindMusic(void)
+void Mix_RewindMusic(int channel)
 {
-    Mix_SetMusicPosition(0.0);
+    Mix_SetMusicPosition(channel, 0.0);
 }
 
-int Mix_PausedMusic(void)
+int Mix_PausedMusic(int channel)
 {
-    return (music_active == SDL_FALSE);
+    return (music_active[channel] == SDL_FALSE);
 }
 
 int Mix_StartTrack(Mix_Music *music, int track)
@@ -1365,32 +1356,32 @@ int Mix_GetNumTracks(Mix_Music *music)
 }
 
 /* Check the status of the music */
-static SDL_bool music_internal_playing(void)
+static SDL_bool music_internal_playing(int channel)
 {
-    if (!music_playing) {
+    if (!music_playing[channel]) {
         return SDL_FALSE;
     }
 
-    if (music_playing->interface->IsPlaying) {
-        music_playing->playing = music_playing->interface->IsPlaying(music_playing->context);
+    if (music_playing[channel]->interface->IsPlaying) {
+        music_playing[channel]->playing = music_playing[channel]->interface->IsPlaying(music_playing[channel]->context);
     }
-    return music_playing->playing;
+    return music_playing[channel]->playing;
 }
-int Mix_PlayingMusic(void)
+int Mix_PlayingMusic(int channel)
 {
     SDL_bool playing;
 
     Mix_LockAudio();
-    playing = music_internal_playing();
+    playing = music_internal_playing(channel);
     Mix_UnlockAudio();
 
     return playing ? 1 : 0;
 }
 
 /* Set the external music playback command */
-int Mix_SetMusicCMD(const char *command)
+int Mix_SetMusicCMD(int channel, const char *command)
 {
-    Mix_HaltMusic();
+    Mix_HaltMusic(channel);
     if (music_cmd) {
         SDL_free(music_cmd);
         music_cmd = NULL;
@@ -1421,11 +1412,13 @@ int Mix_GetSynchroValue(void)
 
 
 /* Uninitialize the music interfaces */
-void close_music(void)
+void close_music()
 {
     size_t i;
 
-    Mix_HaltMusic();
+    for (int i = 0; i < MIX_NUM_MUSIC_STREAMS; ++i) {
+        Mix_HaltMusic(i);
+    }
 
     for (i = 0; i < SDL_arraysize(s_music_interfaces); ++i) {
         Mix_MusicInterface *interface = s_music_interfaces[i];
